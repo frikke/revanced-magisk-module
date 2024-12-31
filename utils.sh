@@ -1,157 +1,254 @@
 #!/usr/bin/env bash
 
 MODULE_TEMPLATE_DIR="revanced-magisk"
-MODULE_SCRIPTS_DIR="scripts"
+CWD=$(pwd)
 TEMP_DIR="temp"
+BIN_DIR="bin"
 BUILD_DIR="build"
-PKGS_LIST="${TEMP_DIR}/module-pkgs"
 
-if [ "${GITHUB_TOKEN:-}" ]; then GH_HEADER="Authorization: token ${GITHUB_TOKEN}"; else GH_HEADER=; fi
-GITHUB_REPOSITORY=${GITHUB_REPOSITORY:-"j-hc/revanced-magisk-module"}
+if [ "${GITHUB_TOKEN-}" ]; then GH_HEADER="Authorization: token ${GITHUB_TOKEN}"; else GH_HEADER=; fi
 NEXT_VER_CODE=${NEXT_VER_CODE:-$(date +'%Y%m%d')}
-WGET_HEADER="User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:108.0) Gecko/20100101 Firefox/108.0"
-REBUILD=false
 OS=$(uname -o)
 
-SERVICE_SH=$(cat $MODULE_SCRIPTS_DIR/service.sh)
-CUSTOMIZE_SH=$(cat $MODULE_SCRIPTS_DIR/customize.sh)
-UNINSTALL_SH=$(cat $MODULE_SCRIPTS_DIR/uninstall.sh)
-
-# -------------------- json/toml --------------------
-json_get() { grep -o "\"${1}\":[^\"]*\"[^\"]*\"" | sed -E 's/".*".*"(.*)"/\1/'; }
-toml_prep() { __TOML__=$(echo "$1" | tr -d '\t\r' | tr "'" '"' | grep -o '^[^#]*' | grep -v '^$' | sed -r 's/(\".*\")|\s*/\1/g; 1i []'); }
-toml_get_table_names() {
-	local tn
-	tn=$(echo "$__TOML__" | grep -x '\[.*\]' | tr -d '[]') || return 1
-	if [ "$(echo "$tn" | sort | uniq -u | wc -l)" != "$(echo "$tn" | wc -l)" ]; then
-		abort "ERROR: Duplicate tables in TOML"
-	fi
-	echo "$tn"
+toml_prep() {
+	if [ ! -f "$1" ]; then return 1; fi
+	if [ "${1##*.}" == toml ]; then
+		__TOML__=$($TOML --output json --file "$1" .)
+	elif [ "${1##*.}" == json ]; then
+		__TOML__=$(cat "$1")
+	else abort "config extension not supported"; fi
 }
-toml_get_table() { sed -n "/\[${1}]/,/^\[.*]$/p" <<<"$__TOML__"; }
+toml_get_table_names() { jq -r -e 'to_entries[] | select(.value | type == "object") | .key' <<<"$__TOML__"; }
+toml_get_table_main() { jq -r -e 'to_entries | map(select(.value | type != "object")) | from_entries' <<<"$__TOML__"; }
+toml_get_table() { jq -r -e ".\"${1}\"" <<<"$__TOML__"; }
 toml_get() {
-	local table=$1 key=$2 val
-	val=$(grep -m 1 "^${key}=" <<<"$table") && echo "${val#*=}" | sed -e "s/^\"//; s/\"$//"
+	local op
+	op=$(jq -r ".\"${2}\" | values" <<<"$1")
+	if [ "$op" ]; then
+		op="${op#"${op%%[![:space:]]*}"}"
+		op="${op%"${op##*[![:space:]]}"}"
+		op=${op//"'"/'"'}
+		echo "$op"
+	else return 1; fi
 }
-# ---------------------------------------------------
 
 pr() { echo -e "\033[0;32m[+] ${1}\033[0m"; }
-epr() { echo -e "\033[0;31m[-] ${1}\033[0m"; }
-abort() { echo >&2 -e "\033[0;31mABORT: $1\033[0m" && exit 1; }
+epr() {
+	echo >&2 -e "\033[0;31m[-] ${1}\033[0m"
+	if [ "${GITHUB_REPOSITORY-}" ]; then echo -e "::error::utils.sh [-] ${1}\n"; fi
+}
+abort() {
+	epr "ABORT: ${1-}"
+	exit 1
+}
 
-get_prebuilts() {
-	pr "Getting prebuilts"
-	local rv_cli_url rv_integrations_url rv_patches rv_patches_changelog rv_patches_dl rv_patches_url rv_integrations_rel rv_patches_rel
-	rv_cli_url=$(gh_req "https://api.github.com/repos/j-hc/revanced-cli/releases/latest" - | json_get 'browser_download_url') || return 1
-	RV_CLI_JAR="${PREBUILTS_DIR}/${rv_cli_url##*/}"
-	log "CLI: ${rv_cli_url##*/}"
+get_rv_prebuilts() {
+	local cli_src=$1 cli_ver=$2 patches_src=$3 patches_ver=$4
+	pr "Getting prebuilts (${patches_src%/*})" >&2
+	local cl_dir=${patches_src%/*}
+	cl_dir=${TEMP_DIR}/${cl_dir,,}-rv
+	[ -d "$cl_dir" ] || mkdir "$cl_dir"
+	for src_ver in "$cli_src CLI $cli_ver revanced-cli" "$patches_src Patches $patches_ver patches"; do
+		set -- $src_ver
+		local src=$1 tag=$2 ver=${3-} fprefix=$4
+		local ext
+		if [ "$tag" = "CLI" ]; then
+			ext="jar"
+			local grab_cl=false
+		elif [ "$tag" = "Patches" ]; then
+			ext="rvp"
+			local grab_cl=true
+		else abort unreachable; fi
+		local dir=${src%/*}
+		dir=${TEMP_DIR}/${dir,,}-rv
+		[ -d "$dir" ] || mkdir "$dir"
 
-	if [ "$CONF_INTEGRATIONS_VER" ]; then
-		rv_integrations_rel="https://api.github.com/repos/${INTEGRATIONS_SRC}/releases/tags/${CONF_INTEGRATIONS_VER}"
-	else
-		rv_integrations_rel="https://api.github.com/repos/${INTEGRATIONS_SRC}/releases/latest"
-	fi
-	if [ "$CONF_PATCHES_VER" ]; then
-		rv_patches_rel="https://api.github.com/repos/${PATCHES_SRC}/releases/tags/${CONF_PATCHES_VER}"
-	else
-		rv_patches_rel="https://api.github.com/repos/${PATCHES_SRC}/releases/latest"
-	fi
+		local rv_rel="https://api.github.com/repos/${src}/releases" name_ver
+		if [ "$ver" = "dev" ]; then
+			name_ver="*-dev*"
+		elif [ "$ver" = "latest" ]; then
+			rv_rel+="/latest"
+			name_ver="*"
+		else
+			rv_rel+="/tags/${ver}"
+			name_ver="$ver"
+		fi
 
-	rv_integrations_url=$(gh_req "$rv_integrations_rel" - | json_get 'browser_download_url')
-	RV_INTEGRATIONS_APK="${PREBUILTS_DIR}/${rv_integrations_url##*/}"
-	log "Integrations: ${rv_integrations_url##*/}"
-
-	rv_patches=$(gh_req "$rv_patches_rel" -)
-	rv_patches_changelog=$(echo "$rv_patches" | json_get 'body' | sed 's/\(\\n\)\+/\\n/g')
-	rv_patches_dl=$(json_get 'browser_download_url' <<<"$rv_patches")
-	RV_PATCHES_JSON="${PREBUILTS_DIR}/patches-$(json_get 'tag_name' <<<"$rv_patches").json"
-	rv_patches_url=$(grep 'jar' <<<"$rv_patches_dl")
-	RV_PATCHES_JAR="${PREBUILTS_DIR}/${rv_patches_url##*/}"
-	[ -f "$RV_PATCHES_JAR" ] || REBUILD=true
-	log "Patches: ${rv_patches_url##*/}"
-	log "\n${rv_patches_changelog//# [/### [}\n"
-
-	dl_if_dne "$RV_CLI_JAR" "$rv_cli_url"
-	dl_if_dne "$RV_INTEGRATIONS_APK" "$rv_integrations_url"
-	dl_if_dne "$RV_PATCHES_JAR" "$rv_patches_url"
-	dl_if_dne "$RV_PATCHES_JSON" "$(grep 'json' <<<"$rv_patches_dl")"
-
-	if [ "$OS" = Android ]; then
-		local arch
-		if [ "$(uname -m)" = aarch64 ]; then arch=arm64; else arch=arm; fi
-		dl_if_dne ${TEMP_DIR}/aapt2 https://github.com/rendiix/termux-aapt/raw/d7d4b4a344cc52b94bcdab3500be244151261d8e/prebuilt-binary/${arch}/aapt2
-	fi
-	mkdir -p ${MODULE_TEMPLATE_DIR}/bin/arm64 ${MODULE_TEMPLATE_DIR}/bin/arm
-	dl_if_dne "${MODULE_TEMPLATE_DIR}/bin/arm64/cmpr" "https://github.com/j-hc/cmpr/releases/latest/download/cmpr-arm64-v8a"
-	dl_if_dne "${MODULE_TEMPLATE_DIR}/bin/arm/cmpr" "https://github.com/j-hc/cmpr/releases/latest/download/cmpr-armeabi-v7a"
-
-	HTMLQ="${TEMP_DIR}/htmlq"
-	if [ ! -f "${TEMP_DIR}/htmlq" ]; then
-		req "https://github.com/mgdm/htmlq/releases/latest/download/htmlq-x86_64-linux.tar.gz" "${TEMP_DIR}/htmlq.tar.gz"
-		tar -xf "${TEMP_DIR}/htmlq.tar.gz" -C "$TEMP_DIR"
-		rm "${TEMP_DIR}/htmlq.tar.gz"
-	fi
+		local url file tag_name name
+		file=$(find "$dir" -name "${fprefix}-${name_ver#v}.${ext}" -type f 2>/dev/null)
+		if [ -z "$file" ]; then
+			local resp asset name
+			resp=$(gh_req "$rv_rel" -) || return 1
+			if [ "$ver" = "dev" ]; then resp=$(jq -r '.[0]' <<<"$resp"); fi
+			tag_name=$(jq -r '.tag_name' <<<"$resp")
+			asset=$(jq -e -r ".assets[] | select(.name | endswith(\"$ext\"))" <<<"$resp") || return 1
+			url=$(jq -r .url <<<"$asset")
+			name=$(jq -r .name <<<"$asset")
+			file="${dir}/${name}"
+			gh_dl "$file" "$url" >&2 || return 1
+			echo "$tag: $(cut -d/ -f1 <<<"$src")/${name}  " >>"${cl_dir}/changelog.md"
+		else
+			grab_cl=false
+			local for_err=$file
+			if [ "$ver" = "latest" ]; then
+				file=$(grep -v '/[^/]*dev[^/]*$' <<<"$file" | head -1)
+			else file=$(grep "/[^/]*${ver#v}[^/]*\$" <<<"$file" | head -1); fi
+			if [ -z "$file" ]; then abort "filter fail: '$for_err' with '$ver'"; fi
+			name=$(basename "$file")
+			tag_name=$(cut -d'-' -f3- <<<"$name")
+			tag_name=v${tag_name%.*}
+		fi
+		if [ "$tag" = "Patches" ]; then
+			if [ $grab_cl = true ]; then echo -e "[Changelog](https://github.com/${src}/releases/tag/${tag_name})\n" >>"${cl_dir}/changelog.md"; fi
+			if [ "$REMOVE_RV_INTEGRATIONS_CHECKS" = true ]; then
+				if ! (
+					mkdir -p "${file}-zip" || return 1
+					unzip -qo "${file}" -d "${file}-zip" || return 1
+					java -cp "${BIN_DIR}/paccer.jar:${BIN_DIR}/dexlib2.jar" com.jhc.Main "${file}-zip/extensions/shared.rve" "${file}-zip/extensions/shared-patched.rve" || return 1
+					mv -f "${file}-zip/extensions/shared-patched.rve" "${file}-zip/extensions/shared.rve" || return 1
+					rm "${file}" || return 1
+					cd "${file}-zip" || abort
+					zip -0rq "${CWD}/${file}" . || return 1
+				) >&2; then
+					echo >&2 "Patching revanced-integrations failed"
+				fi
+				rm -r "${file}-zip" || :
+			fi
+		fi
+		echo -n "$file "
+	done
+	echo
 }
 
 set_prebuilts() {
-	[ -d "$PREBUILTS_DIR" ] || abort "${PREBUILTS_DIR} directory could not be found"
-	RV_CLI_JAR=$(find "$PREBUILTS_DIR" -maxdepth 1 -name "revanced-cli-*.jar" | tail -n1)
-	[ "$RV_CLI_JAR" ] || abort "revanced cli not found"
-	log "CLI: ${RV_CLI_JAR#"$PREBUILTS_DIR/"}"
-	RV_INTEGRATIONS_APK=$(find "$PREBUILTS_DIR" -maxdepth 1 -name "revanced-integrations-*.apk" | tail -n1)
-	[ "$RV_INTEGRATIONS_APK" ] || abort "revanced integrations not found"
-	log "Integrations: ${RV_INTEGRATIONS_APK#"$PREBUILTS_DIR/"}"
-	RV_PATCHES_JAR=$(find "$PREBUILTS_DIR" -maxdepth 1 -name "revanced-patches-*.jar" | tail -n1)
-	[ "$RV_PATCHES_JAR" ] || abort "revanced patches not found"
-	log "Patches: ${RV_PATCHES_JAR#"$PREBUILTS_DIR/"}"
-	RV_PATCHES_JSON=$(find "$PREBUILTS_DIR" -maxdepth 1 -name "patches-*.json" | tail -n1)
-	[ "$RV_PATCHES_JSON" ] || abort "patches.json not found"
-	HTMLQ="${TEMP_DIR}/htmlq"
+	APKSIGNER="${BIN_DIR}/apksigner.jar"
+	if [ "$OS" = Android ]; then
+		local arch
+		if [ "$(uname -m)" = aarch64 ]; then arch=arm64; else arch=arm; fi
+		HTMLQ="${BIN_DIR}/htmlq/htmlq-${arch}"
+		AAPT2="${BIN_DIR}/aapt2/aapt2-${arch}"
+		TOML="${BIN_DIR}/toml/tq-${arch}"
+	else
+		HTMLQ="${BIN_DIR}/htmlq/htmlq-x86_64"
+		TOML="${BIN_DIR}/toml/tq-x86_64"
+	fi
 }
 
-req() { wget -nv -O "$2" --header="$WGET_HEADER" "$1"; }
-gh_req() { wget -nv -O "$2" --header="$GH_HEADER" "$1"; }
-log() { echo -e "$1  " >>build.md; }
-get_largest_ver() {
-	local max v
-	read -r max
-	semver_validate "$max" || return 1
-	while read -r v; do
-		if [ "$(semver_cmp "$max" "$v")" = 1 ]; then max=$v; fi
-	done
-	echo "$max"
-}
-get_patch_last_supported_ver() {
-	jq -r ".[] | select(.compatiblePackages[].name==\"${1}\") | .compatiblePackages[].versions" "$RV_PATCHES_JSON" | tr -d ' ,\t[]"' | sort -u | grep -v '^$' | get_largest_ver || return 1
-}
-semver_cmp() {
-	IFS=. read -r -a v1 <<<"${1//[^.0-9]/}"
-	IFS=. read -r -a v2 <<<"${2//[^.0-9]/}"
-	local c1="${1//[^.]/}"
-	local c2="${2//[^.]/}"
-	local mi=$((${#c1} < ${#c2} ? ${#c1} : ${#c2}))
-	for ((i = 0; i <= mi; i++)); do
-		if ((v1[i] > v2[i])); then
-			echo -1
-			return 0
-		elif ((v2[i] > v1[i])); then
-			echo 1
-			return 0
+config_update() {
+	if [ ! -f build.md ]; then abort "build.md not available"; fi
+	declare -A sources
+	: >"$TEMP_DIR"/skipped
+	local upped=()
+	local prcfg=false
+	for table_name in $(toml_get_table_names); do
+		if [ -z "$table_name" ]; then continue; fi
+		t=$(toml_get_table "$table_name")
+		enabled=$(toml_get "$t" enabled) || enabled=true
+		if [ "$enabled" = false ]; then continue; fi
+		PATCHES_SRC=$(toml_get "$t" patches-source) || PATCHES_SRC=$DEF_PATCHES_SRC
+		PATCHES_VER=$(toml_get "$t" patches-version) || PATCHES_VER=$DEF_PATCHES_VER
+		if [[ -v sources["$PATCHES_SRC/$PATCHES_VER"] ]]; then
+			if [ "${sources["$PATCHES_SRC/$PATCHES_VER"]}" = 1 ]; then upped+=("$table_name"); fi
+		else
+			sources["$PATCHES_SRC/$PATCHES_VER"]=0
+			local rv_rel="https://api.github.com/repos/${PATCHES_SRC}/releases"
+			if [ "$PATCHES_VER" = "dev" ]; then
+				last_patches=$(gh_req "$rv_rel" - | jq -e -r '.[0]')
+			elif [ "$PATCHES_VER" = "latest" ]; then
+				last_patches=$(gh_req "$rv_rel/latest" -)
+			else
+				last_patches=$(gh_req "$rv_rel/tags/${ver}" -)
+			fi
+			if ! last_patches=$(jq -e -r '.assets[] | select(.name | endswith("rvp")) | .name' <<<"$last_patches"); then
+				abort oops
+			fi
+			if [ "$last_patches" ]; then
+				if ! OP=$(grep "^Patches: ${PATCHES_SRC%%/*}/" build.md | grep "$last_patches"); then
+					sources["$PATCHES_SRC/$PATCHES_VER"]=1
+					prcfg=true
+					upped+=("$table_name")
+				else
+					echo "$OP" >>"$TEMP_DIR"/skipped
+				fi
+			fi
 		fi
 	done
-	echo 0
+	if [ "$prcfg" = true ]; then
+		local query=""
+		for table in "${upped[@]}"; do
+			if [ -n "$query" ]; then query+=" or "; fi
+			query+=".key == \"$table\""
+		done
+		jq "to_entries | map(select(${query} or (.value | type != \"object\"))) | from_entries" <<<"$__TOML__"
+	fi
+}
+
+_req() {
+	local ip="$1" op="$2"
+	shift 2
+	if [ "$op" = - ]; then
+		curl -L -c "$TEMP_DIR/cookie.txt" -b "$TEMP_DIR/cookie.txt" --connect-timeout 5 --retry 0 --fail -s -S "$@" "$ip"
+	else
+		if [ -f "$op" ]; then return; fi
+		local dlp
+		dlp="$(dirname "$op")/tmp.$(basename "$op")"
+		if [ -f "$dlp" ]; then
+			while [ -f "$dlp" ]; do sleep 1; done
+			return
+		fi
+		curl -L -c "$TEMP_DIR/cookie.txt" -b "$TEMP_DIR/cookie.txt" --connect-timeout 5 --retry 0 --fail -s -S "$@" "$ip" -o "$dlp" || return 1
+		mv -f "$dlp" "$op"
+	fi
+}
+req() { _req "$1" "$2" -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:108.0) Gecko/20100101 Firefox/108.0"; }
+gh_req() { _req "$1" "$2" -H "$GH_HEADER"; }
+gh_dl() {
+	if [ ! -f "$1" ]; then
+		pr "Getting '$1' from '$2'"
+		_req "$2" "$1" -H "$GH_HEADER" -H "Accept: application/octet-stream"
+	fi
+}
+
+log() { echo -e "$1  " >>"build.md"; }
+get_highest_ver() {
+	local vers m
+	vers=$(tee)
+	m=$(head -1 <<<"$vers")
+	if ! semver_validate "$m"; then echo "$m"; else sort -rV <<<"$vers" | head -1; fi
 }
 semver_validate() {
 	local a="${1%-*}"
 	local ac="${a//[.0-9]/}"
 	[ ${#ac} = 0 ]
 }
-
-dl_if_dne() {
-	if [ ! -f "$1" ]; then
-		pr "Getting '$1' from '$2'"
-		req "$2" "$1"
+get_patch_last_supported_ver() {
+	local list_patches=$1 pkg_name=$2 inc_sel=$3 _exc_sel=$4 _exclusive=$5 # TODO: resolve using all of these
+	local op
+	if [ "$inc_sel" ]; then
+		if ! op=$(awk '{$1=$1}1' <<<"$list_patches"); then
+			epr "list-patches: '$op'"
+			return 1
+		fi
+		local ver vers="" NL=$'\n'
+		while IFS= read -r line; do
+			line="${line:1:${#line}-2}"
+			ver=$(sed -n "/^Name: $line\$/,/^\$/p" <<<"$op" | sed -n "/^Compatible versions:\$/,/^\$/p" | tail -n +2)
+			vers=${ver}${NL}
+		done <<<"$(list_args "$inc_sel")"
+		vers=$(awk '{$1=$1}1' <<<"$vers")
+		if [ "$vers" ]; then
+			get_highest_ver <<<"$vers"
+			return
+		fi
 	fi
+	if ! op=$(java -jar "$rv_cli_jar" list-versions "$rv_patches_jar" -f "$pkg_name" 2>&1 | tail -n +3 | awk '{$1=$1}1'); then
+		epr "list-versions: '$op'"
+		return 1
+	fi
+	if [ "$op" = "Any" ]; then return; fi
+	pcount=$(head -1 <<<"$op") pcount=${pcount#*(} pcount=${pcount% *}
+	if [ -z "$pcount" ]; then abort "unreachable: '$pcount'"; fi
+	grep -F "($pcount patch" <<<"$op" | sed 's/ (.* patch.*//' | get_highest_ver || return 1
 }
 
 isoneof() {
@@ -161,40 +258,90 @@ isoneof() {
 	return 1
 }
 
+merge_splits() {
+	local bundle=$1 output=$2
+	pr "Merging splits"
+	gh_dl "$TEMP_DIR/apkeditor.jar" "https://github.com/REAndroid/APKEditor/releases/download/V1.3.9/APKEditor-1.3.9.jar" >/dev/null || return 1
+	if ! OP=$(java -jar "$TEMP_DIR/apkeditor.jar" merge -i "${bundle}" -o "${bundle}.mzip" -clean-meta -f 2>&1); then
+		epr "$OP"
+		return 1
+	fi
+	# this is required because of apksig
+	mkdir "${bundle}-zip"
+	unzip -qo "${bundle}.mzip" -d "${bundle}-zip"
+	pushd "${bundle}-zip" || abort
+	zip -0rq "${CWD}/${bundle}.zip" .
+	popd || abort
+	# if building module, sign the merged apk properly
+	if isoneof "module" "${build_mode_arr[@]}"; then
+		patch_apk "${bundle}.zip" "${output}" "--exclusive" "${args[cli]}" "${args[ptjar]}"
+		local ret=$?
+	else
+		cp "${bundle}.zip" "${output}"
+		local ret=$?
+	fi
+	rm -r "${bundle}-zip" "${bundle}.zip" "${bundle}.mzip" || :
+	return $ret
+}
+
 # -------------------- apkmirror --------------------
-dl_apkmirror() {
-	local url=$1 version=${2// /-} output=$3 arch=$4
-	local resp node app_table dlurl=""
-	[ "$arch" = universal ] && apparch=(universal noarch 'arm64-v8a + armeabi-v7a') || apparch=("$arch")
-	url="${url}/${url##*/}-${version//./-}-release/"
-	resp=$(req "$url" -) || return 1
-	for ((n = 2; n < 50; n++)); do
-		node=$($HTMLQ "div.table-row:nth-child($n)" -r "span.signature:nth-child(n)" <<<"$resp")
+apk_mirror_search() {
+	local resp="$1" dpi="$2" arch="$3" apk_bundle="$4"
+	local apparch dlurl node app_table
+	if [ "$arch" = all ]; then
+		apparch=(universal noarch 'arm64-v8a + armeabi-v7a')
+	else apparch=("$arch" universal noarch 'arm64-v8a + armeabi-v7a'); fi
+	for ((n = 1; n < 40; n++)); do
+		node=$($HTMLQ "div.table-row.headerFont:nth-last-child($n)" -r "span:nth-child(n+3)" <<<"$resp")
 		if [ -z "$node" ]; then break; fi
 		app_table=$($HTMLQ --text --ignore-whitespace <<<"$node")
-		if [ "$(sed -n 8p <<<"$app_table")" = nodpi ] &&
-			[ "$(sed -n 3p <<<"$app_table")" = APK ] &&
-			isoneof "$(sed -n 6p <<<"$app_table")" "${apparch[@]}"; then
-			dlurl=https://www.apkmirror.com$($HTMLQ --attribute href "div:nth-child(1) > a:nth-child(1)" <<<"$node")
-			break
+		if [ "$(sed -n 3p <<<"$app_table")" = "$apk_bundle" ] && [ "$(sed -n 6p <<<"$app_table")" = "$dpi" ] &&
+			isoneof "$(sed -n 4p <<<"$app_table")" "${apparch[@]}"; then
+			dlurl=$($HTMLQ --base https://www.apkmirror.com --attribute href "div:nth-child(1) > a:nth-child(1)" <<<"$node")
+			echo "$dlurl"
+			return 0
 		fi
 	done
-	[ -z "$dlurl" ] && return 1
-	url="https://www.apkmirror.com$(req "$dlurl" - | tr '\n' ' ' | sed -n 's;.*href="\(.*key=[^"]*\)">.*;\1;p')"
-	url="https://www.apkmirror.com$(req "$url" - | tr '\n' ' ' | sed -n 's;.*href="\(.*key=[^"]*\)">.*;\1;p')"
-	req "$url" "$output"
+	return 1
+}
+dl_apkmirror() {
+	local url=$1 version=${2// /-} output=$3 arch=$4 dpi=$5 is_bundle=false
+	if [ -f "${output}.apkm" ]; then
+		is_bundle=true
+	else
+		if [ "$arch" = "arm-v7a" ]; then arch="armeabi-v7a"; fi
+		local resp node app_table dlurl=""
+		url="${url}/${url##*/}-${version//./-}-release/"
+		resp=$(req "$url" -) || return 1
+		node=$($HTMLQ "div.table-row.headerFont:nth-last-child(1)" -r "span:nth-child(n+3)" <<<"$resp")
+		if [ "$node" ]; then
+			if ! dlurl=$(apk_mirror_search "$resp" "$dpi" "${arch}" "APK"); then
+				if ! dlurl=$(apk_mirror_search "$resp" "$dpi" "${arch}" "BUNDLE"); then
+					return 1
+				else is_bundle=true; fi
+			fi
+			[ -z "$dlurl" ] && return 1
+			resp=$(req "$dlurl" -)
+		fi
+		url=$(echo "$resp" | $HTMLQ --base https://www.apkmirror.com --attribute href "a.btn") || return 1
+		url=$(req "$url" - | $HTMLQ --base https://www.apkmirror.com --attribute href "span > a[rel = nofollow]") || return 1
+	fi
+
+	if [ "$is_bundle" = true ]; then
+		req "$url" "${output}.apkm"
+		merge_splits "${output}.apkm" "${output}"
+	else
+		req "$url" "${output}"
+	fi
 }
 get_apkmirror_vers() {
-	local apkmirror_category=$1 allow_alpha_version=$2
 	local vers apkm_resp
-	apkm_resp=$(req "https://www.apkmirror.com/uploads/?appcategory=${apkmirror_category}" -)
-	# apkm_name=$(echo "$apkm_resp" | sed -n 's;.*Latest \(.*\) Uploads.*;\1;p')
-	vers=$(sed -n 's;.*Version:</span><span class="infoSlide-value">\(.*\) </span>.*;\1;p' <<<"$apkm_resp")
-	if [ "$allow_alpha_version" = false ]; then
+	apkm_resp=$(req "https://www.apkmirror.com/uploads/?appcategory=${__APKMIRROR_CAT__}" -)
+	vers=$(sed -n 's;.*Version:</span><span class="infoSlide-value">\(.*\) </span>.*;\1;p' <<<"$apkm_resp" | awk '{$1=$1}1')
+	if [ "$__AAV__" = false ]; then
 		local IFS=$'\n'
 		vers=$(grep -iv "\(beta\|alpha\)" <<<"$vers")
-		local v
-		local r_vers=()
+		local v r_vers=()
 		for v in $vers; do
 			grep -iq "${v} \(beta\|alpha\)" <<<"$apkm_resp" || r_vers+=("$v")
 		done
@@ -203,154 +350,147 @@ get_apkmirror_vers() {
 		echo "$vers"
 	fi
 }
-get_apkmirror_pkg_name() { req "$1" - | sed -n 's;.*id=\(.*\)" class="accent_color.*;\1;p'; }
-# --------------------------------------------------
+get_apkmirror_pkg_name() { sed -n 's;.*id=\(.*\)" class="accent_color.*;\1;p' <<<"$__APKMIRROR_RESP__"; }
+get_apkmirror_resp() {
+	__APKMIRROR_RESP__=$(req "${1}" -)
+	__APKMIRROR_CAT__="${1##*/}"
+}
 
 # -------------------- uptodown --------------------
-get_uptodown_resp() { req "${1}/versions" -; }
-get_uptodown_vers() { sed -n 's;.*version">\(.*\)</span>$;\1;p' <<<"$1"; }
+get_uptodown_resp() {
+	__UPTODOWN_RESP__=$(req "${1}/versions" -)
+	__UPTODOWN_RESP_PKG__=$(req "${1}/download" -)
+}
+get_uptodown_vers() { $HTMLQ --text ".version" <<<"$__UPTODOWN_RESP__"; }
 dl_uptodown() {
-	local uptwod_resp=$1 version=$2 output=$3
-	local url
-	url=$(echo "$uptwod_resp" | grep "${version}<\/span>" -B 2 | head -1 | sed -n 's;.*data-url="\(.*\)".*;\1;p') || return 1
-	url=$(req "$url" - | sed -n 's;.*data-url="\(.*\)".*;\1;p') || return 1
-	req "$url" "$output"
+	local uptodown_dlurl=$1 version=$2 output=$3 arch=$4 _dpi=$5
+	if [ "$arch" = "arm-v7a" ]; then arch="armeabi-v7a"; fi
+	local op resp data_code
+	data_code=$($HTMLQ "#detail-app-name" --attribute data-code <<<"$__UPTODOWN_RESP__")
+	local versionURL=""
+	for i in {1..5}; do
+		resp=$(req "${uptodown_dlurl}/apps/${data_code}/versions/${i}" -)
+		if ! op=$(jq -e -r ".data | map(select(.version == \"${version}\" and .kindFile == \"apk\")) | .[0]" <<<"$resp"); then
+			continue
+		fi
+		if versionURL=$(jq -e -r '.versionURL' <<<"$op"); then break; else return 1; fi
+	done
+	if [ -z "$versionURL" ]; then return 1; fi
+	resp=$(req "$versionURL" -) || return 1
+	if [ "$arch" != all ]; then
+		local data_version files node_arch data_file_id
+		data_version=$($HTMLQ '.button.variants' --attribute data-version <<<"$resp") || return 1
+		files=$(req "${uptodown_dlurl%/*}/app/${data_code}/version/${data_version}/files" - | jq -e -r .content) || return 1
+		for ((n = 1; n < 12; n += 2)); do
+			node_arch=$($HTMLQ ".content > p:nth-child($n)" --text <<<"$files" | xargs) || return 1
+			if [ -z "$node_arch" ]; then return 1; fi
+			if [ "$node_arch" != "$arch" ]; then continue; fi
+			data_file_id=$($HTMLQ "div.variant:nth-child($((n + 1))) > .v-report" --attribute data-file-id <<<"$files") || return 1
+			resp=$(req "${uptodown_dlurl}/download/${data_file_id}" -)
+			break
+		done
+	fi
+	local data_url
+	data_url=$($HTMLQ "#detail-download-button" --attribute data-url <<<"$resp") || return 1
+	req "https://dw.uptodown.com/dwn/${data_url}" "$output"
 }
-get_uptodown_pkg_name() {
-	local p
-	p=$(req "${1}/download" - | grep -A 1 "Package Name" | tail -1)
-	echo "${p:4:-5}"
+get_uptodown_pkg_name() { $HTMLQ --text "tr.full:nth-child(1) > td:nth-child(3)" <<<"$__UPTODOWN_RESP_PKG__"; }
+
+# -------------------- archive --------------------
+dl_archive() {
+	local url=$1 version=$2 output=$3 arch=$4
+	local path version=${version// /}
+	path=$(grep "${version_f#v}-${arch// /}" <<<"$__ARCHIVE_RESP__") || return 1
+	req "${url}/${path}" "$output"
 }
+get_archive_resp() {
+	local r
+	r=$(req "$1" -)
+	if [ -z "$r" ]; then return 1; else __ARCHIVE_RESP__=$(sed -n 's;^<a href="\(.*\)"[^"]*;\1;p' <<<"$r"); fi
+	__ARCHIVE_PKG_NAME__=$(awk -F/ '{print $NF}' <<<"$1")
+}
+get_archive_vers() { sed 's/^[^-]*-//;s/-\(all\|arm64-v8a\|arm-v7a\)\.apk//g' <<<"$__ARCHIVE_RESP__"; }
+get_archive_pkg_name() { echo "$__ARCHIVE_PKG_NAME__"; }
 # --------------------------------------------------
 
 patch_apk() {
-	local stock_input=$1 patched_apk=$2 patcher_args=$3
-	declare -r tdir=$(mktemp -d -p $TEMP_DIR)
-	local cmd="java -jar $RV_CLI_JAR --rip-lib x86_64 --rip-lib x86 --temp-dir=$tdir -c -a $stock_input -o $patched_apk -b $RV_PATCHES_JAR --keystore=ks.keystore $patcher_args"
-	if [ "$OS" = Android ]; then
-		cmd+=" --custom-aapt2-binary=${TEMP_DIR}/aapt2"
-	fi
+	local stock_input=$1 patched_apk=$2 patcher_args=$3 rv_cli_jar=$4 rv_patches_jar=$5
+	local cmd="env -u GITHUB_REPOSITORY java -jar $rv_cli_jar patch $stock_input --purge -o $patched_apk -p $rv_patches_jar --keystore=ks.keystore \
+--keystore-entry-password=123456789 --keystore-password=123456789 --signer=jhc --keystore-entry-alias=jhc $patcher_args"
+	if [ "$OS" = Android ]; then cmd+=" --custom-aapt2-binary=${AAPT2}"; fi
 	pr "$cmd"
-	if [ "${DRYRUN:-}" = true ]; then
-		cp -f "$stock_input" "$patched_apk"
-	else
-		eval "$cmd"
+	if eval "$cmd"; then [ -f "$patched_apk" ]; else
+		rm "$patched_apk" 2>/dev/null || :
+		return 1
 	fi
-	[ -f "$patched_apk" ]
 }
 
-zip_module() {
-	pr "Packing module ($app_name)"
-	local patched_apk=$1 module_name=$2 stock_apk=$3 pkg_name=$4 template_dir=$5
-	cp -f "$patched_apk" "${template_dir}/base.apk"
-	cp -f "$stock_apk" "${template_dir}/${pkg_name}.apk"
-	pushd >/dev/null "$template_dir" || abort "Module template dir not found"
-	zip -"$COMPRESSION_LEVEL" -FSqr "../../${BUILD_DIR}/${module_name}" .
-	popd >/dev/null || :
+check_sig() {
+	local file=$1 pkg_name=$2
+	local sig
+	if grep -q "$pkg_name" sig.txt; then
+		sig=$(java -jar "$APKSIGNER" verify --print-certs "$file" | grep ^Signer | grep SHA-256 | tail -1 | awk '{print $NF}')
+		grep -qFx "$sig $pkg_name" sig.txt
+	fi
 }
 
 build_rv() {
-	local -n args=$1
-	local version build_mode_arr pkg_name uptwod_resp
+	eval "declare -A args=${1#*=}"
+	local version="" pkg_name=""
 	local mode_arg=${args[build_mode]} version_mode=${args[version]}
 	local app_name=${args[app_name]}
 	local app_name_l=${app_name,,}
+	app_name_l=${app_name_l// /-}
+	local table=${args[table]}
 	local dl_from=${args[dl_from]}
 	local arch=${args[arch]}
+	local arch_f="${arch// /}"
+
 	local p_patcher_args=()
-	p_patcher_args+=("$(join_args "${args[excluded_patches]}" -e) $(join_args "${args[included_patches]}" -i)")
+	if [ "${args[excluded_patches]}" ]; then p_patcher_args+=("$(join_args "${args[excluded_patches]}" -d)"); fi
+	if [ "${args[included_patches]}" ]; then p_patcher_args+=("$(join_args "${args[included_patches]}" -e)"); fi
 	[ "${args[exclusive_patches]}" = true ] && p_patcher_args+=("--exclusive")
 
-	if [ "$dl_from" = apkmirror ]; then
-		pkg_name=$(get_apkmirror_pkg_name "${args[apkmirror_dlurl]}")
-	elif [ "$dl_from" = uptodown ]; then
-		uptwod_resp=$(get_uptodown_resp "${args[uptodown_dlurl]}")
-		pkg_name=$(get_uptodown_pkg_name "${args[uptodown_dlurl]}")
+	local tried_dl=()
+	for dl_p in archive apkmirror uptodown; do
+		if [ -z "${args[${dl_p}_dlurl]}" ]; then continue; fi
+		if ! get_${dl_p}_resp "${args[${dl_p}_dlurl]}" || ! pkg_name=$(get_"${dl_p}"_pkg_name); then
+			args[${dl_p}_dlurl]=""
+			epr "ERROR: Could not find ${table} in ${dl_p}"
+			continue
+		fi
+		tried_dl+=("$dl_p")
+		dl_from=$dl_p
+		break
+	done
+	if [ -z "$pkg_name" ]; then
+		epr "empty pkg name, not building ${table}."
+		return 0
 	fi
+	local list_patches
+	list_patches=$(java -jar "$rv_cli_jar" list-patches "$rv_patches_jar" -f "$pkg_name" -v -p 2>&1)
 
 	local get_latest_ver=false
 	if [ "$version_mode" = auto ]; then
-		version=$(get_patch_last_supported_ver "$pkg_name") || get_latest_ver=true
-	elif [ "$version_mode" = latest ]; then
+		if ! version=$(get_patch_last_supported_ver "$list_patches" "$pkg_name" \
+			"${args[included_patches]}" "${args[excluded_patches]}" "${args[exclusive_patches]}"); then
+			exit 1
+		elif [ -z "$version" ]; then get_latest_ver=true; fi
+	elif isoneof "$version_mode" latest beta; then
 		get_latest_ver=true
-		p_patcher_args+=("--experimental")
+		p_patcher_args+=("-f")
 	else
 		version=$version_mode
-		p_patcher_args+=("--experimental")
+		p_patcher_args+=("-f")
 	fi
 	if [ $get_latest_ver = true ]; then
-		local apkmvers uptwodvers
-		if [ "$dl_from" = apkmirror ]; then
-			apkmvers=$(get_apkmirror_vers "${args[apkmirror_dlurl]##*/}" "${args[allow_alpha_version]}")
-			version=$(get_largest_ver <<<"$apkmvers") || version=$(head -1 <<<"$apkmvers")
-		elif [ "$dl_from" = uptodown ]; then
-			uptwodvers=$(get_uptodown_vers "$uptwod_resp")
-			version=$(get_largest_ver <<<"$uptwodvers") || version=$(head -1 <<<"$uptwodvers")
-		fi
+		if [ "$version_mode" = beta ]; then __AAV__="true"; else __AAV__="false"; fi
+		pkgvers=$(get_"${dl_from}"_vers)
+		version=$(get_highest_ver <<<"$pkgvers") || version=$(head -1 <<<"$pkgvers")
 	fi
 	if [ -z "$version" ]; then
-		pr "empty version, not building ${app_name}."
+		epr "empty version, not building ${table}."
 		return 0
-	fi
-	pr "Choosing version '${version}' (${app_name})"
-	local version_f=${version// /}
-	local stock_apk="${TEMP_DIR}/${pkg_name}-${version_f}-${arch}.apk"
-	if [ ! -f "$stock_apk" ]; then
-		if [ "$dl_from" = apkmirror ]; then
-			pr "Downloading '${app_name}' from APKMirror"
-			local apkm_arch
-			if [ "$arch" = "all" ]; then
-				apkm_arch="universal"
-			elif [ "$arch" = "arm64-v8a" ]; then
-				apkm_arch="arm64-v8a"
-			elif [ "$arch" = "arm-v7a" ]; then
-				apkm_arch="armeabi-v7a"
-			fi
-			if ! dl_apkmirror "${args[apkmirror_dlurl]}" "$version" "$stock_apk" "$apkm_arch"; then
-				epr "ERROR: Could not find any release of '${app_name}' with version '${version}' and arch '${apkm_arch}' from APKMirror"
-				return 0
-			fi
-		elif [ "$dl_from" = uptodown ]; then
-			pr "Downloading '${app_name}' from Uptodown"
-			if ! dl_uptodown "$uptwod_resp" "$version" "$stock_apk"; then
-				epr "ERROR: Could not download ${app_name} from Uptodown"
-				return 0
-			fi
-		fi
-	fi
-	if [ "${arch}" = "all" ]; then
-		grep -q "${app_name}:" build.md || log "${app_name}: ${version}"
-	else
-		grep -q "${app_name} (${arch}):" build.md || log "${app_name} (${arch}): ${version}"
-	fi
-	if jq -r ".[] | select(.compatiblePackages[].name==\"${pkg_name}\") | .dependencies[]" "$RV_PATCHES_JSON" | grep -qF integrations; then
-		p_patcher_args+=("-m ${RV_INTEGRATIONS_APK}")
-	fi
-
-	local microg_patch
-	microg_patch=$(jq -r ".[] | select(.compatiblePackages[].name==\"${pkg_name}\") | .name" "$RV_PATCHES_JSON" | grep -F microg || :)
-	if [ "$microg_patch" ]; then
-		p_patcher_args=("${p_patcher_args[@]//-[ei] ${microg_patch}/}")
-	fi
-
-	local stock_bundle="${TEMP_DIR}/${pkg_name}-${version_f}-${arch}-bundle.zip"
-	local stock_bundle_apk="${TEMP_DIR}/${pkg_name}-${version_f}-${arch}-bundle.apk"
-	local is_bundle=false
-	if [ "$mode_arg" = module ] || [ "$mode_arg" = both ]; then
-		if [ -f "$stock_bundle_apk" ]; then
-			is_bundle=true
-		elif [ "$dl_from" = TODO ]; then
-			pr "Downloading '${app_name}' bundle from APKMirror"
-			if dl_apkmirror "${args[apkmirror_dlurl]}" "$version" "BUNDLE</span>[^@]*@\([^#]*\)" "$stock_bundle"; then
-				pr "'${app_name}' bundle was downloaded successfully and will be used for the module"
-				is_bundle=true
-				unzip "$stock_bundle" "base.apk" -d $TEMP_DIR
-				mv ${TEMP_DIR}/base.apk "$stock_bundle_apk"
-				rm -f "$stock_bundle"
-			else
-				pr "'${app_name}' bundle was not found"
-			fi
-		fi
 	fi
 
 	if [ "$mode_arg" = module ]; then
@@ -360,101 +500,132 @@ build_rv() {
 	elif [ "$mode_arg" = both ]; then
 		build_mode_arr=(apk module)
 	fi
+
+	pr "Choosing version '${version}' for ${table}"
+	local version_f=${version// /}
+	version_f=${version_f#v}
+	local stock_apk="${TEMP_DIR}/${pkg_name}-${version_f}-${arch_f}.apk"
+	if [ ! -f "$stock_apk" ]; then
+		for dl_p in archive apkmirror uptodown; do
+			if [ -z "${args[${dl_p}_dlurl]}" ]; then continue; fi
+			pr "Downloading '${table}' from ${dl_p}"
+			if ! isoneof $dl_p "${tried_dl[@]}"; then get_${dl_p}_resp "${args[${dl_p}_dlurl]}"; fi
+			if ! dl_${dl_p} "${args[${dl_p}_dlurl]}" "$version" "$stock_apk" "$arch" "${args[dpi]}" "$get_latest_ver"; then
+				epr "ERROR: Could not download '${table}' from ${dl_p} with version '${version}', arch '${arch}', dpi '${args[dpi]}'"
+				continue
+			fi
+			break
+		done
+		if [ ! -f "$stock_apk" ]; then return 0; fi
+	fi
+	if ! check_sig "$stock_apk" "$pkg_name"; then
+		abort "apk signature mismatch '$stock_apk'"
+	fi
+	log "${table}: ${version}"
+
+	local microg_patch
+	microg_patch=$(grep "^Name: " <<<"$list_patches" | grep -i "gmscore\|microg" || :) microg_patch=${microg_patch#*: }
+	if [ -n "$microg_patch" ] && [[ ${p_patcher_args[*]} =~ $microg_patch ]]; then
+		epr "You cant include/exclude microg patch as that's done by rvmm builder automatically."
+		p_patcher_args=("${p_patcher_args[@]//-[ei] ${microg_patch}/}")
+	fi
+	local spoof_streams_patch
+	spoof_streams_patch=$(grep "^Name: " <<<"$list_patches" | grep -i "spoof" | grep -i "streams" || :) spoof_streams_patch=${spoof_streams_patch#*: }
+	if [ -n "$spoof_streams_patch" ] && [[ ${p_patcher_args[*]} =~ $spoof_streams_patch ]]; then
+		epr "You cant include/exclude spoof stream patch as that's done by rvmm builder automatically."
+		p_patcher_args=("${p_patcher_args[@]//-[ei] ${spoof_streams_patch}/}")
+	fi
+
 	local patcher_args patched_apk build_mode
+	local rv_brand_f=${args[rv_brand],,}
+	rv_brand_f=${rv_brand_f// /-}
+	if [ "${args[patcher_args]}" ]; then p_patcher_args+=("${args[patcher_args]}"); fi
 	for build_mode in "${build_mode_arr[@]}"; do
 		patcher_args=("${p_patcher_args[@]}")
-		pr "Building '${app_name}' (${arch}) in '$build_mode' mode"
-		if [ "$microg_patch" ]; then
-			patched_apk="${TEMP_DIR}/${app_name_l}-${RV_BRAND_F}-${version_f}-${arch}-${build_mode}.apk"
-			if [ "$build_mode" = apk ]; then
-				patcher_args+=("-i ${microg_patch}")
-			elif [ "$build_mode" = module ]; then
-				patcher_args+=("-e ${microg_patch}")
-			fi
+		pr "Building '${table}' in '$build_mode' mode"
+		if [ -n "$microg_patch" ] || [ -n "$spoof_streams_patch" ]; then
+			patched_apk="${TEMP_DIR}/${app_name_l}-${rv_brand_f}-${version_f}-${arch_f}-${build_mode}.apk"
 		else
-			patched_apk="${TEMP_DIR}/${app_name_l}-${RV_BRAND_F}-${version_f}-${arch}.apk"
+			patched_apk="${TEMP_DIR}/${app_name_l}-${rv_brand_f}-${version_f}-${arch_f}.apk"
 		fi
-		if [ "$build_mode" = module ]; then
-			if [ $is_bundle = false ]; then
-				patcher_args+=("--unsigned --rip-lib arm64-v8a --rip-lib armeabi-v7a")
-			else
-				patcher_args+=("--unsigned")
+		if [ -n "$microg_patch" ]; then
+			if [ "$build_mode" = apk ]; then
+				patcher_args+=("-e \"${microg_patch}\"")
+			elif [ "$build_mode" = module ]; then
+				patcher_args+=("-d \"${microg_patch}\"")
 			fi
 		fi
-		if [ ! -f "$patched_apk" ] || [ "$REBUILD" = true ]; then
-			if ! patch_apk "$stock_apk" "$patched_apk" "${patcher_args[*]}"; then
-				pr "Building '${app_name}' failed!"
+		if [ -n "$spoof_streams_patch" ]; then
+			if [ "$build_mode" = apk ]; then
+				patcher_args+=("-e \"${spoof_streams_patch}\"")
+			elif [ "$build_mode" = module ]; then
+				patcher_args+=("-d \"${spoof_streams_patch}\"")
+			fi
+		fi
+		if [ "${args[riplib]}" = true ]; then
+			patcher_args+=("--rip-lib x86_64 --rip-lib x86")
+			if [ "$build_mode" = module ]; then
+				patcher_args+=("--rip-lib arm64-v8a --rip-lib armeabi-v7a --unsigned")
+			else
+				if [ "$arch" = "arm64-v8a" ]; then
+					patcher_args+=("--rip-lib armeabi-v7a")
+				elif [ "$arch" = "arm-v7a" ]; then
+					patcher_args+=("--rip-lib arm64-v8a")
+				fi
+			fi
+		fi
+		if [ "${NORB:-}" != true ] || [ ! -f "$patched_apk" ]; then
+			if ! patch_apk "$stock_apk" "$patched_apk" "${patcher_args[*]}" "${args[cli]}" "${args[ptjar]}"; then
+				epr "Building '${table}' failed!"
 				return 0
 			fi
 		fi
 		if [ "$build_mode" = apk ]; then
-			local apk_output="${BUILD_DIR}/${app_name_l}-${RV_BRAND_F}-v${version_f}-${arch}.apk"
-			cp -f "$patched_apk" "$apk_output"
-			pr "Built ${app_name} (${arch}) (non-root): '${apk_output}'"
+			local apk_output="${BUILD_DIR}/${app_name_l}-${rv_brand_f}-v${version_f}-${arch_f}.apk"
+			mv -f "$patched_apk" "$apk_output"
+			pr "Built ${table} (non-root): '${apk_output}'"
 			continue
 		fi
-		local base_template upj
-		base_template=$(mktemp -d -p $TEMP_DIR)
+		local base_template
+		base_template=$(mktemp -d -p "$TEMP_DIR")
 		cp -a $MODULE_TEMPLATE_DIR/. "$base_template"
-		if [ "$BUILD_MINDETACH_MODULE" = true ] && ! grep -q "$pkg_name" $PKGS_LIST; then echo "$pkg_name" >>$PKGS_LIST; fi
-		if [ "$arch" = "all" ]; then
-			upj="${app_name_l}-update.json"
-		else
-			upj="${app_name_l}-${arch}-update.json"
-		fi
-		local isbndl extrct stock_apk_module
-		if [ $is_bundle = true ]; then
-			isbndl=""
-			extrct="base.apk"
-			stock_apk_module=$stock_bundle_apk
-		else
-			isbndl="!"
-			extrct="${pkg_name}.apk"
-			stock_apk_module=$stock_apk
-		fi
+		local upj="${table,,}-update.json"
 
-		uninstall_sh "$pkg_name" "$isbndl" "$base_template"
-		service_sh "$pkg_name" "$version" "$base_template"
-		customize_sh "$pkg_name" "$version" "$arch" "$extrct" "$base_template"
+		module_config "$base_template" "$pkg_name" "$version" "$arch"
+
+		local rv_patches_ver="${rv_patches_jar##*-}"
 		module_prop \
 			"${args[module_prop_name]}" \
-			"${app_name} ${RV_BRAND}" \
-			"$version" \
-			"${app_name} ${RV_BRAND} Magisk module" \
-			"https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/update/${upj}" \
+			"${app_name} ${args[rv_brand]}" \
+			"${version} (patches: ${rv_patches_ver%%.rvp})" \
+			"${app_name} ${args[rv_brand]} Magisk module" \
+			"https://raw.githubusercontent.com/${GITHUB_REPOSITORY-}/update/${upj}" \
 			"$base_template"
 
-		local module_output="${app_name_l}-${RV_BRAND_F}-magisk-v${version}-${arch}.zip"
-		if [ ! -f "$module_output" ] || [ "$REBUILD" = true ]; then
-			zip_module "$patched_apk" "$module_output" "$stock_apk_module" "$pkg_name" "$base_template"
-		fi
-
-		pr "Built ${app_name} (${arch}) (root): '${BUILD_DIR}/${module_output}'"
+		local module_output="${app_name_l}-${rv_brand_f}-magisk-v${version_f}-${arch_f}.zip"
+		pr "Packing module ${table}"
+		cp -f "$patched_apk" "${base_template}/base.apk"
+		if [ "${args[include_stock]}" = true ]; then cp -f "$stock_apk" "${base_template}/${pkg_name}.apk"; fi
+		pushd >/dev/null "$base_template" || abort "Module template dir not found"
+		zip -"$COMPRESSION_LEVEL" -FSqr "${CWD}/${BUILD_DIR}/${module_output}" .
+		popd >/dev/null || :
+		pr "Built ${table} (root): '${BUILD_DIR}/${module_output}'"
 	done
 }
 
-join_args() {
-	echo "$1" | tr -d '\t\r' | tr ' ' '\n' | grep -v '^$' | sed "s/^/${2} /" | paste -sd " " - || :
-}
+list_args() { tr -d '\t\r' <<<"$1" | tr -s ' ' | sed 's/" "/"\n"/g' | sed 's/\([^"]\)"\([^"]\)/\1'\''\2/g' | grep -v '^$' || :; }
+join_args() { list_args "$1" | sed "s/^/${2} /" | paste -sd " " - || :; }
 
-uninstall_sh() {
-	local s="${UNINSTALL_SH//__PKGNAME/$1}"
-	echo "${s//__ISBNDL/$2}" >"${3}/uninstall.sh"
-}
-customize_sh() {
-	local s="${CUSTOMIZE_SH//__PKGNAME/$1}"
-	s="${s//__EXTRCT/$4}"
-	# shellcheck disable=SC2001
-	if [ "$3" = "arm64-v8a" ]; then
-		s=$(sed 's/#arm$/abort "ERROR: Wrong arch\nYour device: arm\nModule: arm64"/g' <<<"$s")
-	elif [ "$3" = "arm-v7a" ]; then
-		s=$(sed 's/#arm64$/abort "ERROR: Wrong arch\nYour device: arm64\nModule: arm"/g' <<<"$s")
+module_config() {
+	local ma=""
+	if [ "$4" = "arm64-v8a" ]; then
+		ma="arm64"
+	elif [ "$4" = "arm-v7a" ]; then
+		ma="arm"
 	fi
-	echo "${s//__PKGVER/$2}" >"${5}/customize.sh"
-}
-service_sh() {
-	local s="${SERVICE_SH//__PKGNAME/$1}"
-	echo "${s//__PKGVER/$2}" >"${3}/service.sh"
+	echo "PKG_NAME=$2
+PKG_VER=$3
+MODULE_ARCH=$ma" >"$1/config"
 }
 module_prop() {
 	echo "id=${1}
