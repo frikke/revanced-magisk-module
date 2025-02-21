@@ -6,7 +6,7 @@ pr() { echo -e "\033[0;32m[+] ${1}\033[0m"; }
 ask() {
 	local y
 	for ((n = 0; n < 3; n++)); do
-		pr "$1"
+		pr "$1 [y/n]"
 		if read -r y; then
 			if [ "$y" = y ]; then
 				return 0
@@ -19,49 +19,66 @@ ask() {
 	return 1
 }
 
-pr "Setting up environment..."
-yes "" | pkg update -y && pkg install -y git wget openssl jq openjdk-17 zip
-
-pr "Cloning revanced-magisk-module repository..."
-if [ -d revanced-magisk-module ]; then
-	if ask "Directory revanced-magisk-module already exists. Do you want to clone the repo again and overwrite your config? [y/n]"; then
-		rm -rf revanced-magisk-module
-		git clone https://github.com/j-hc/revanced-magisk-module --recurse --depth 1
-		sed -i '/^enabled.*/d; /^\[.*\]/a enabled = false' revanced-magisk-module/config.toml
-	fi
-else
-	git clone https://github.com/j-hc/revanced-magisk-module --recurse --depth 1
-	sed -i '/^enabled.*/d; /^\[.*\]/a enabled = false' revanced-magisk-module/config.toml
-fi
-
-if [ ! -f build.sh ]; then
-	cd revanced-magisk-module
-fi
-
-if ask "Do you want to open the config.toml for customizations? [y/n]"; then
-	nano config.toml
-else
-	pr "No app is selected for patching!"
-fi
-if ! ask "Setup is done. Do you want to start building? [y/n]"; then
-	exit 0
-fi
-./build.sh
-
-cd build
 pr "Ask for storage permission"
 until
 	yes | termux-setup-storage >/dev/null 2>&1
 	ls /sdcard >/dev/null 2>&1
-do
-	sleep 1
-done
+do sleep 1; done
+if [ ! -f ~/.rvmm_"$(date '+%Y%m')" ]; then
+	pr "Setting up environment..."
+	yes "" | pkg update -y && pkg upgrade -y && pkg install -y git curl jq openjdk-17 zip
+	: >~/.rvmm_"$(date '+%Y%m')"
+fi
+mkdir -p /sdcard/Download/revanced-magisk-module/
 
+if [ -d revanced-magisk-module ] || [ -f config.toml ]; then
+	if [ -d revanced-magisk-module ]; then cd revanced-magisk-module; fi
+	pr "Checking for revanced-magisk-module updates"
+	git fetch
+	if git status | grep -q 'is behind\|fatal'; then
+		pr "revanced-magisk-module is not synced with upstream."
+		pr "Cloning revanced-magisk-module. config.toml will be preserved."
+		cd ..
+		cp -f revanced-magisk-module/config.toml .
+		rm -rf revanced-magisk-module
+		git clone https://github.com/j-hc/revanced-magisk-module --recurse --depth 1
+		mv -f config.toml revanced-magisk-module/config.toml
+		cd revanced-magisk-module
+	fi
+else
+	pr "Cloning revanced-magisk-module."
+	git clone https://github.com/j-hc/revanced-magisk-module --depth 1
+	cd revanced-magisk-module
+	sed -i '/^enabled.*/d; /^\[.*\]/a enabled = false' config.toml
+	grep -q 'revanced-magisk-module' ~/.gitconfig 2>/dev/null ||
+		git config --global --add safe.directory ~/revanced-magisk-module
+fi
+
+[ -f ~/storage/downloads/revanced-magisk-module/config.toml ] ||
+	cp config.toml ~/storage/downloads/revanced-magisk-module/config.toml
+
+if ask "Open rvmm-config-gen to generate a config?"; then
+	am start -a android.intent.action.VIEW -d https://j-hc.github.io/rvmm-config-gen/
+fi
+printf "\n"
+until
+	if ask "Open 'config.toml' to configure builds?\nAll are disabled by default, you will need to enable at first time building"; then
+		am start -a android.intent.action.VIEW -d file:///sdcard/Download/revanced-magisk-module/config.toml -t text/plain
+	fi
+	ask "Setup is done. Do you want to start building?"
+do :; done
+cp -f ~/storage/downloads/revanced-magisk-module/config.toml config.toml
+
+./build.sh
+
+cd build
 PWD=$(pwd)
-mkdir ~/storage/downloads/revanced-magisk-module 2>/dev/null || :
 for op in *; do
-	[ "$op" = "*" ] && continue
-	cp -f "${PWD}/${op}" ~/storage/downloads/revanced-magisk-module/"${op}"
+	[ "$op" = "*" ] && {
+		pr "glob fail"
+		exit 1
+	}
+	mv -f "${PWD}/${op}" ~/storage/downloads/revanced-magisk-module/"${op}"
 done
 
 pr "Outputs are available in /sdcard/Download/revanced-magisk-module folder"
